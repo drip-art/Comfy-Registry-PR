@@ -21,6 +21,7 @@ import {
   planDesignCommentNotification,
 } from "./slackNotifications";
 import { slackMessageUrlParse, slackMessageUrlStringify } from "./slackMessageUrlParse";
+import { filterReviewers } from "./filterReviewers";
 const tlog = createTimeLogger();
 
 /**
@@ -254,21 +255,37 @@ export async function runGithubDesignTask() {
           });
 
       if (task.state === "open") {
-        if (
-          task.type === "pull_request" &&
-          REQUEST_REVIEWERS.some((e) => !task.reviewers?.includes(e))
-        ) {
-          const requestReviewers = REQUEST_REVIEWERS;
-          const newReviewers = requestReviewers.filter((e) => !task.reviewers?.includes(e));
-          tlog(`Requesting reviewers: ${newReviewers.join(", ")}`);
-          if (!dryRun) {
-            await gh.pulls.requestReviewers({
-              owner,
-              repo,
-              pull_number: issue_number,
-              reviewers: newReviewers,
-            });
-            task = await saveGithubDesignTask(url, { reviewers: requestReviewers });
+        if (task.type === "pull_request") {
+          const { requestReviewers, newReviewers } = filterReviewers(
+            REQUEST_REVIEWERS,
+            task.user,
+            task.reviewers,
+          );
+          if (newReviewers.length > 0) {
+            tlog(`Requesting reviewers: ${newReviewers.join(", ")}`);
+            if (!dryRun) {
+              let reviewersRequested = false;
+              try {
+                await gh.pulls.requestReviewers({
+                  owner,
+                  repo,
+                  pull_number: issue_number,
+                  reviewers: newReviewers,
+                });
+                reviewersRequested = true;
+              } catch (err: unknown) {
+                // GitHub may return 422 when a requested reviewer cannot be added,
+                // such as when they are not a collaborator or cannot be requested.
+                // We log but don't persist, so the request will be retried on the
+                // next run (the reviewer may become eligible later).
+                const status = (err as { status?: number })?.status;
+                if (status !== 422) throw err;
+                tlog(`Reviewer request rejected (422): ${err}`);
+              }
+              if (reviewersRequested) {
+                task = await saveGithubDesignTask(url, { reviewers: requestReviewers });
+              }
+            }
           }
         }
 
