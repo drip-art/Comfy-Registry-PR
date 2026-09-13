@@ -431,20 +431,46 @@ async function runCorePingTaskFull() {
     const diff = Date.now() - (at instanceof Date ? at.getTime() : at);
     return "for " + ms(diff, { long: true });
   };
+  const groupByAuthor = <T extends { author?: string; statusAt?: Date | number }>(prs: T[]) => {
+    const groups = new Map<string, T[]>();
+    for (const pr of prs) {
+      const author = pr.author ?? "unknown";
+      if (!groups.has(author)) groups.set(author, []);
+      groups.get(author)!.push(pr);
+    }
+    // Sort PRs within each group by statusAt (oldest first)
+    for (const [, group] of groups) {
+      group.sort((a, b) => {
+        const aTime = a.statusAt instanceof Date ? a.statusAt.getTime() : (a.statusAt ?? 0);
+        const bTime = b.statusAt instanceof Date ? b.statusAt.getTime() : (b.statusAt ?? 0);
+        return aTime - bTime;
+      });
+    }
+    // Sort author groups by their oldest PR's statusAt (oldest first)
+    return [...groups.entries()].sort(([, a], [, b]) => {
+      const aTime = a[0].statusAt instanceof Date ? a[0].statusAt.getTime() : (a[0].statusAt ?? 0);
+      const bTime = b[0].statusAt instanceof Date ? b[0].statusAt.getTime() : (b[0].statusAt ?? 0);
+      return aTime - bTime;
+    });
+  };
+
+  const formatGroupedPRs = (
+    groups: [string, ComfyCorePRs[]][],
+    formatPR: (pr: ComfyCorePRs) => string,
+  ) =>
+    groups
+      .map(([author, prs]) => `*@${author}*:\n${prs.map((pr) => `  - ${formatPR(pr)}`).join("\n")}`)
+      .join("\n");
+
   const reviewMessage = !pendingReviewCorePRs.length
     ? `Congratulations! All Core/Important PRs are reviewed! 🎉🎉🎉`
     : `Hey <@comfy>, Here's x${pendingReviewCorePRs.length} Core/Important PRs waiting your feedback!
-- ${pendingReviewCorePRs.map((pr) => `@${pr.author}: <${pr.url}|${pr.title}> (${pr.labels}) is ${pr.status} ${forDuration(pr.statusAt)}`).join("\n- ")}`;
+${formatGroupedPRs(groupByAuthor(pendingReviewCorePRs), (pr) => `<${pr.url}|${pr.title}> (${pr.labels}) is ${pr.status} ${forDuration(pr.statusAt)}`)}`;
+
   const keepInMindMessage =
     remainingOpeningCorePRs.length > 0
       ? `\n\nAdditionally, there ${remainingOpeningCorePRs.length === 1 ? "is" : "are"} ${remainingOpeningCorePRs.length} other open Core/Important ${remainingOpeningCorePRs.length === 1 ? "PR" : "PRs"} that ${remainingOpeningCorePRs.length === 1 ? "is" : "are"} pending for author's change/update, lets wait for them.
-- ${remainingOpeningCorePRs
-          .toSorted(compareBy((e) => e.created_at))
-          .map(
-            (pr) =>
-              `@${pr.author}: <${pr.url}|${pr.title}> is ${pr.status} ${forDuration(pr.statusAt)}`,
-          )
-          .join("\n- ")}`
+${formatGroupedPRs(groupByAuthor(remainingOpeningCorePRs.toSorted(compareBy((e) => e.created_at))), (pr) => `<${pr.url}|${pr.title}> is ${pr.status} ${forDuration(pr.statusAt)}`)}`
       : "";
   const tail = `\n\nSent from <https://github.com/Comfy-Org/Comfy-PR/blob/main/app/tasks/coreping/coreping.ts|CorePing.ts> by <@snomiao>`;
 
