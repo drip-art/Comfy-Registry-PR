@@ -37,6 +37,9 @@ import { getReleaseComparison } from "./releaseComparison";
  *    Fetches up to `maxReleasesToCheck` (10) releases from ComfyUI_frontend.
  *    Filters them by:
  *      - `processSince` date (skip very old releases)
+ *      - `target_commitish === mainBranch` (skip releases NOT made from the
+ *        main branch — e.g. patch releases from RC branches like `core/1.42`
+ *        already have their commits on that branch, nothing to backport)
  *      - `maxMinorVersionsBehind` (4) — only show releases whose minor version
  *        is at most 4 behind the latest (e.g. if latest is v1.40, v1.36 is
  *        included but v1.35 is not)
@@ -209,6 +212,7 @@ const config = {
   maxReleasesToCheck: 10, // fetch more releases, then filter by version distance
   maxMinorVersionsBehind: 4, // stop showing backport warnings after this many minor versions behind latest
   processSince: new Date("2026-01-06T00:00:00Z").toISOString(), // only process releases since this date, to avoid posting too msgs in old releases
+  mainBranch: "main", // only process releases made from this branch (skips RC branch releases like core/1.42)
 
   // 2. identify bugfix commits
   reBugfixPatterns: /\b(fix|bugfix|hotfix|patch|bug)\b/i,
@@ -416,6 +420,18 @@ export default async function runGithubFrontendBackportCheckerTask() {
   // Process each release
   const processedReleases = await sflow(releases)
     .filter((release) => +new Date(release.created_at) >= +new Date(config.processSince))
+    // Filter out releases not made from main branch (e.g. RC branch releases like core/1.42 don't need backport checks)
+    .filter((release) => {
+      if (release.target_commitish !== config.mainBranch) {
+        logger.debug(
+          "Skipping release %s (target: %s, not from main)",
+          release.tag_name,
+          release.target_commitish,
+        );
+        return false;
+      }
+      return true;
+    })
     // Filter by version distance: show releases up to and including maxMinorVersionsBehind behind latest
     .filter((release) => {
       const minor = parseMinorVersion(release.tag_name);
