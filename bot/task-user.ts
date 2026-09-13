@@ -51,6 +51,7 @@ export async function createTaskUser(workspaceId: string): Promise<TaskUser> {
     await $`id ${username}`.quiet();
     // User exists, just ensure home dir
     await $`mkdir -p ${homeDir}/.claude`.quiet();
+    await ensureClaudeConfig(homeDir);
     await $`chown -R ${username}:${TASK_USER_GROUP} ${homeDir}`.quiet();
     await writeTaskActivity(username);
     return { username, homeDir };
@@ -60,10 +61,42 @@ export async function createTaskUser(workspaceId: string): Promise<TaskUser> {
 
   await $`useradd --system --no-create-home --gid ${TASK_USER_GROUP} --shell /bin/sh ${username}`.quiet();
   await $`mkdir -p ${homeDir}/.claude`.quiet();
+  await ensureClaudeConfig(homeDir);
   await $`chown -R ${username}:${TASK_USER_GROUP} ${homeDir}`.quiet();
   await writeTaskActivity(username);
 
   return { username, homeDir };
+}
+
+/**
+ * The Claude Agent SDK CLI bails out immediately if `~/.claude.json`
+ * exists but is empty or otherwise unparsable as JSON — the agent
+ * subprocess exits with code 1 on launch and the only error visible
+ * is "Configuration error in /…/.claude.json: JSON Parse error: Unexpected EOF".
+ *
+ * The CLI itself sometimes truncates the file mid-write on an aborted run,
+ * leaving a 0-byte file that poisons every subsequent task spawn for the
+ * same user. Defensively normalize: write a minimal `{}` whenever the file
+ * is missing, empty, or invalid JSON. The CLI will fill in real fields on
+ * its first successful run.
+ */
+async function ensureClaudeConfig(homeDir: string): Promise<void> {
+  const path = `${homeDir}/.claude.json`;
+  let content = "";
+  try {
+    content = await Bun.file(path).text();
+  } catch {
+    // missing file is fine, fall through to write {}
+  }
+  if (content.trim()) {
+    try {
+      JSON.parse(content);
+      return; // already valid
+    } catch {
+      /* corrupt — overwrite */
+    }
+  }
+  await Bun.write(path, "{}");
 }
 
 /** Set up workspace directory ownership for the task user */

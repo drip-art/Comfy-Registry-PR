@@ -12,6 +12,7 @@ import { createHmac, timingSafeEqual } from "crypto";
 import DIE from "@snomiao/die";
 import { compareBy } from "comparing";
 import { mkdir } from "fs/promises";
+import { existsSync } from "fs";
 import sflow from "sflow";
 import winston from "winston";
 import zChatCompletion, { initZChat } from "../lib/zChat";
@@ -38,6 +39,7 @@ import {
   touchTaskUserActivity,
 } from "./task-user";
 import { createUserSpawner } from "./spawn-as-user";
+import { enqueueWebhook, startWebhookConsumer, type WebhookQueueDoc } from "./webhook-queue";
 
 export const SLACK_ORG_DOMAIN_NAME = "comfy-organization";
 // Configure winston logger
@@ -280,7 +282,10 @@ export async function startSlackBot() {
           });
         }
 
-        // Event callbacks — handle async, respond 200 immediately
+        // Event callbacks — push into the MongoDB webhook_queue and
+        // respond 200 immediately. The actual Slack event dispatch happens
+        // in the changeStream consumer started below in startSlackBot(),
+        // so a bot restart mid-task can't drop the webhook on the floor.
         if (payload.type === "event_callback") {
           const retryNum = req.headers.get("x-slack-retry-num");
           const retryReason = req.headers.get("x-slack-retry-reason");
@@ -296,25 +301,26 @@ export async function startSlackBot() {
             return new Response("", { status: 200 });
           }
 
-          // TTL 1h — Slack retries up to ~30min, so 1h covers worst case
+          // TTL 1h — Slack retries up to ~30min, so 1h covers worst case.
+          // This is independent of the queue's 24h TTL: the dedup key only
+          // lives on the http-edge to suppress retry storms; queue docs
+          // are authoritative for replay.
           await SlackBotState.set(
             `webhook-event-${eventId}`,
             { receivedAt: Date.now(), retryNum, retryReason },
             60 * 60 * 1000,
           );
 
-          // Slack Events API puts the workspace id on the *envelope*
-          // (`payload.team_id`), not on the inner event in some shapes.
-          // Forward it onto the event so downstream zod schemas that
-          // require `team` (zAppMentionEvent, zSlackMessage filter) don't
-          // silently reject webhook-delivered mentions/DMs.
-          const event = {
-            ...payload.event,
-            team: payload.event?.team || payload.team_id,
-          };
-          handleSlackEvent(event).catch((err) =>
-            logger.error("Webhook event handler error", { err, eventId }),
-          );
+          await enqueueWebhook({
+            source: "slack",
+            eventId,
+            payload,
+            meta: {
+              retryNum: retryNum ?? null,
+              retryReason: retryReason ?? null,
+              receivedAt: Date.now(),
+            },
+          }).catch((err) => logger.error("Webhook enqueue failed", { err, eventId }));
         }
 
         return new Response("", { status: 200 });
@@ -389,6 +395,48 @@ export async function startSlackBot() {
     restartManager.start();
     logger.info("Smart restart manager enabled (use --no-watch to disable)");
   }
+
+  // Start the webhook queue consumer. Drains backlog (any unprocessed docs
+  // sitting in Mongo from a previous crash/restart) then tails the
+  // changeStream for new ones. Slack docs go through the existing
+  // handleSlackEvent; github/notion are accepted into the queue but only
+  // logged for now (no downstream handler yet — adding one is what closes
+  // the multi-source story).
+  await startWebhookConsumer({
+    sources: ["slack", "github", "notion"],
+    drainBacklog: true,
+    logger: {
+      info: (msg, meta) => logger.info(`[webhook-queue] ${msg}`, meta as object),
+      warn: (msg, meta) => logger.warn(`[webhook-queue] ${msg}`, meta as object),
+      error: (msg, meta) => logger.error(`[webhook-queue] ${msg}`, meta as object),
+    },
+    consume: async (doc: WebhookQueueDoc) => {
+      if (doc.source === "slack") {
+        const payload = doc.payload as { event?: Record<string, unknown>; team_id?: string };
+        // Forward team_id from envelope onto event for the same reason as
+        // before (some Events API payloads only have it on the envelope).
+        const event = {
+          ...payload.event,
+          team: (payload.event as { team?: string } | undefined)?.team || payload.team_id,
+        };
+        await handleSlackEvent(event);
+        return;
+      }
+      if (doc.source === "github") {
+        const eventType = (doc.meta as { eventType?: string } | undefined)?.eventType;
+        logger.info(
+          `[webhook-queue] github event ${doc.eventId} (${eventType}) — no handler wired yet`,
+        );
+        return;
+      }
+      if (doc.source === "notion") {
+        const type = (doc.payload as { type?: string } | undefined)?.type;
+        logger.info(`[webhook-queue] notion event ${doc.eventId} (${type}) — no handler wired yet`);
+        return;
+      }
+    },
+  });
+  logger.info("Webhook queue consumer started");
 
   // Periodic cleanup of stale task users (every hour)
   setInterval(
@@ -497,7 +545,31 @@ async function handleSlackEvent(event: unknown) {
     const messageEvent = zSlackMessage.parse(raw);
     logger.debug("MESSAGE EVENT", { event });
 
-    if (messageEvent.bot_id) return;
+    // Default: ignore messages from any bot to prevent bot-vs-bot loops.
+    // Exception: env-configured allowlist of "human-equivalent" bots
+    // (typically a developer's CLI like `sc sl send` posting via their
+    // own Slack app) so we can drive end-to-end tests without logging
+    // into the human Slack account.
+    //
+    // SLACK_ALLOWED_BOT_IDS / SLACK_ALLOWED_APP_IDS are comma-separated.
+    if (messageEvent.bot_id) {
+      const allowedBotIds = (process.env.SLACK_ALLOWED_BOT_IDS ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const allowedAppIds = (process.env.SLACK_ALLOWED_APP_IDS ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const botAppId = (messageEvent as { app_id?: string }).app_id;
+      const isAllowed =
+        allowedBotIds.includes(messageEvent.bot_id) ||
+        (botAppId && allowedAppIds.includes(botAppId));
+      if (!isAllowed) return;
+      logger.info(
+        `Allowing bot message from bot_id=${messageEvent.bot_id} app_id=${botAppId} (allowlisted for testing)`,
+      );
+    }
 
     const botUserId = process.env.SLACK_BOT_USER_ID || "U078499LK5K";
     const text = messageEvent.text || "";
@@ -533,6 +605,27 @@ async function handleSlackEvent(event: unknown) {
   }
 }
 async function spawnBotOnSlackMessageEvent(event: z.infer<typeof zAppMentionEvent>) {
+  // Whole-task safety net. Anything thrown from setup, the SDK loop, the
+  // cleanup tail, or a stray Slack/Mongo call inside this body MUST NOT
+  // escape this function or it crashes the master and takes every other
+  // running task down with it.
+  try {
+    return await spawnBotOnSlackMessageEventInner(event);
+  } catch (err) {
+    logger.error(`Task crashed for event ${event.ts} in channel ${event.channel}`, {
+      err:
+        err instanceof Error
+          ? { name: err.name, message: err.message, stack: err.stack?.slice(0, 4000) }
+          : err,
+    });
+    // Best-effort: drop this task from the working-tasks list so a restart
+    // doesn't try to resume a poison-pill message forever.
+    await removeWorkingTask(event).catch(() => {});
+    return;
+  }
+}
+
+async function spawnBotOnSlackMessageEventInner(event: z.infer<typeof zAppMentionEvent>) {
   // Dedup by content hash so message edits with new intent re-trigger,
   // but truly identical retries within 10s are suppressed.
   const contentHash = createHmac("sha256", "msg")
@@ -1071,12 +1164,25 @@ Respond in JSON format with the following fields:
     }
   }
 
-  // clone https://github.com/Comfy-Org/Comfy-PR/tree/sno-bot to ./repos/prbot (branch: sno-bot)
+  // Make the PR-Bot source tree available to the agent under
+  // codes/Comfy-Org/pr-bot/tree/main. Idempotent: a previous spawn for the
+  // same workspace will already have populated this dir; re-running
+  // `git clone` against an existing directory dumps a stderr storm
+  // (`fatal: destination path '...' already exists`) on every restart
+  // (see 2026-05-11 pm2 logs). If the .git directory is present, just
+  // fast-forward; otherwise clone fresh.
   const prBotRepoDir = `${botWorkingDir}/codes/Comfy-Org/pr-bot/tree/main`;
   await mkdir(prBotRepoDir, { recursive: true });
-  await Bun.$`git clone --branch main https://github.com/Comfy-Org/Comfy-PR ${prBotRepoDir}`.catch(
-    () => null,
-  );
+  try {
+    const hasGit = existsSync(`${prBotRepoDir}/.git`);
+    if (hasGit) {
+      await Bun.$`cd ${prBotRepoDir} && git fetch --quiet origin main && git reset --hard --quiet origin/main`.quiet();
+    } else {
+      await Bun.$`git clone --quiet --branch main https://github.com/Comfy-Org/Comfy-PR ${prBotRepoDir}`.quiet();
+    }
+  } catch (cloneErr) {
+    logger.warn("PR-Bot source tree prepare failed (non-fatal)", { err: cloneErr });
+  }
 
   // await Bun.write(`${botWorkingDir}/PROMPT.txt`, agentPrompt);
 
@@ -1448,8 +1554,15 @@ ${yaml.stringify(contexts)}
       GITHUB_TOKEN: ghToken,
     };
     // Whitelist anything the agent legitimately needs at runtime.
+    //
+    // ANTHROPIC_API_KEY is intentionally NOT forwarded: the claude binary
+    // prefers it over OAuth when present, which forced the agent onto
+    // pay-per-token API billing and exhausted credit on 2026-04-30. The task
+    // user's HOME has the host's `claude login` OAuth credentials copied in
+    // by `ensureClaudeCredentials`, so the binary auths via Claude Max/Pro
+    // subscription instead. To opt back into API billing for a single task,
+    // export ANTHROPIC_API_KEY explicitly here.
     for (const k of [
-      "ANTHROPIC_API_KEY",
       "OPENAI_API_KEY",
       "NOTION_TOKEN",
       "SLACK_BOT_TOKEN", // agent uses prbot slack update / read
@@ -1465,13 +1578,32 @@ ${yaml.stringify(contexts)}
       if (v) passEnv[k] = v;
     }
 
+    // Pin to the glibc binary explicitly. The SDK's auto-resolution
+    // tries `@anthropic-ai/claude-agent-sdk-linux-x64-musl` first (because
+    // it's installed alongside `-linux-x64`), but the musl variant fails
+    // on Debian/Ubuntu hosts with "No such file or directory" because
+    // /lib/ld-musl-x86_64.so.1 isn't present in glibc-based images. The
+    // failure looks like a generic "exit code 1" and was the root cause
+    // of the bot dying on every Slack DM (2026-04-30 incident).
+    const sdkRoot = require.resolve("@anthropic-ai/claude-agent-sdk/package.json");
+    const claudeBinary = sdkRoot.replace(
+      /\/claude-agent-sdk\/package\.json$/,
+      "/claude-agent-sdk-linux-x64/claude",
+    );
+
     agentQuery = query({
       prompt: sdkPrompt,
       options: {
         cwd: botWorkingDir,
+        pathToClaudeCodeExecutable: claudeBinary,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
-        settingSources: ["project"], // loads CLAUDE.md from cwd
+        // SDK isolation mode: do not load ANY filesystem settings or CLAUDE.md.
+        // The host's `/root/.claude/CLAUDE.md` is in Japanese ("すべての返答は
+        // 自然な日本語で行ってください") and would leak into the agent's tone
+        // even when the user wrote in English. Each task gets a clean context;
+        // intent context flows in via PROMPT.txt only.
+        settingSources: [],
         maxTurns,
         persistSession: false,
         abortController,
@@ -1552,7 +1684,16 @@ ${yaml.stringify(contexts)}
     }
   } catch (err) {
     exitCode = 1;
-    logger.error("Agent SDK error:", { err });
+    // winston serializes Error objects as `{}`, which made the
+    // ".claude.json corrupt → spawn dies immediately" incident
+    // (2026-04-29) hard to debug — the only log line was `{err:{}}`.
+    // Pull message+stack out by hand so the next regression is visible.
+    const e = err as Error & { code?: string | number };
+    logger.error(`Agent SDK error: ${e?.message ?? String(err)}`, {
+      name: e?.name,
+      code: e?.code,
+      stack: e?.stack?.slice(0, 4000),
+    });
   } finally {
     clearInterval(slackUpdateInterval);
     // Remove loading icon if still showing

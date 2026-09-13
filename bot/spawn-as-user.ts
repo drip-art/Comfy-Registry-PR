@@ -40,14 +40,51 @@ export function createUserSpawner(
             ? "/root/.local/bin/claude"
             : command;
 
-    // Use sudo to run as the task user
-    const sudoArgs = ["-n", "-u", username, "--preserve-env", resolvedCommand, ...args];
+    // `sudo --preserve-env` with no list uses the env_keep policy
+    // (HOME, PATH, TERM only) and silently drops everything else,
+    // including ANTHROPIC_API_KEY. The Claude SDK CLI then exits
+    // immediately at startup, mid-write of ~/.claude.json, leaving a
+    // corrupted file that poisons every later spawn for this user.
+    //
+    // Fix: explicitly enumerate every env key we want forwarded so
+    // sudo lets them through. We pass childEnv (built above) verbatim,
+    // sudo strips it down to the listed keys before exec.
+    const preserveKeys = Object.keys(childEnv).filter((k) => childEnv[k] !== undefined);
+    const sudoArgs = [
+      "-n",
+      "-u",
+      username,
+      `--preserve-env=${preserveKeys.join(",")}`,
+      resolvedCommand,
+      ...args,
+    ];
+
+    if (process.env.DEBUG_SPAWN === "1") {
+      console.log("[spawn-as-user] sudo", sudoArgs.slice(0, 4).join(" "), "...", resolvedCommand);
+      console.log("[spawn-as-user] cwd=", cwd);
+      console.log(
+        "[spawn-as-user] passes:",
+        Object.keys(childEnv)
+          .filter((k) =>
+            ["HOME", "USER", "PATH", "ANTHROPIC_API_KEY", "GH_TOKEN", "MONGODB_URI"].includes(k),
+          )
+          .join(","),
+      );
+    }
 
     const proc = spawn("sudo", sudoArgs, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnv,
     }) as unknown as ChildProcessWithoutNullStreams;
+
+    // Mirror stderr to our process so the SDK's `stderr` callback in
+    // bot/slack-bot.ts catches early-startup errors. Without this,
+    // a Claude Code CLI that dies before producing JSON-formatted SDK
+    // messages just shows up as "exit code 1" with no context.
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      process.stderr.write(`[spawn-as-user stderr] ${chunk}`);
+    });
 
     // Wire up abort signal
     if (signal) {

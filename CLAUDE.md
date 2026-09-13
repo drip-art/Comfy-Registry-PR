@@ -1,14 +1,22 @@
 # Claude Development Notes
 
-## Bot Startup (PM2)
+## Bot Startup (oxmgr)
 
-The Slack bot runs on the `sno-bot` branch and should always be running via PM2.
+The Slack bot runs on the `sno-bot` branch and should always be running via oxmgr.
+
+> Migrated from pm2 to oxmgr on 2026-05-12. The npm-installed oxmgr binary
+> ships glibc-linked and requires GLIBC_2.39 (Debian 13+); on Debian 12 we
+> manually swap in the musl static-pie binary from the GitHub release:
+> `/root/.nvm/versions/node/v25.2.1/lib/node_modules/oxmgr/vendor/oxmgr`.
+> Original at `.glibc.bak`. Upstream tracking: Vladimir-Urik/OxMgr#32.
 
 ### Start / Restart
 
 ```bash
 # Start (or restart if already running)
-pm2 start /root/.bun/bin/bun --name comfy-pr-bot --interpreter none -- bot/index.ts --continue
+oxmgr start --name comfy-pr-bot --restart always \
+  --cwd /v1/code/Comfy-Org/Comfy-PR/tree/sno-bot \
+  "/root/.bun/bin/bun bot/index.ts --continue"
 
 # Or use the convenience script (stops old instance first)
 bash bot/up.sh
@@ -17,15 +25,19 @@ bash bot/up.sh
 ### Check Status & Logs
 
 ```bash
-pm2 status comfy-pr-bot
-pm2 logs comfy-pr-bot --lines 50 --nostream
+oxmgr ls                       # one-line status
+oxmgr status comfy-pr-bot      # detailed view
+oxmgr logs comfy-pr-bot        # recent logs
+oxmgr logs comfy-pr-bot -f     # follow live
 ```
+
+Log files are at `/root/.local/share/oxmgr/logs/comfy-pr-bot.{out,err}.log`.
 
 ### Stop
 
 ```bash
-pm2 stop comfy-pr-bot
-pm2 delete comfy-pr-bot
+oxmgr stop comfy-pr-bot
+oxmgr rm   comfy-pr-bot   # also drops the persisted definition
 ```
 
 ### Important Notes
@@ -35,6 +47,7 @@ pm2 delete comfy-pr-bot
 - Port `3475` is used for health checks (env `PRBOT_PORT`)
 - RestartManager watches `bot/`, `src/`, `lib/` for file changes and auto-restarts when idle
 - If the bot crash-loops, check for merge conflicts: `grep -n '<<<<<<' bot/slack-bot.ts`
+- If a single resumed task triggers a SIGKILL loop (memory spike), clear `current-working-tasks` from SlackBotState; helper: `bun tmp/clear-working-tasks.ts`. See project memory `bot-poison-pill-task.md`.
 
 ## Security: Top-Level `await createIndex` Is Intentional
 

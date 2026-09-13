@@ -148,6 +148,12 @@ export class ErrorCollector {
   }
 
   private async processErrorFile(errorPath: string) {
+    // Skip ephemeral atomic-write temp files (`*.tmp.<pid>.<ts>`). The
+    // watcher fires on the temp's create; by the time the 500ms debounce
+    // elapses, the writer has rename()'d it away and the read ENOENTs.
+    // That's the expected steady-state, not an error worth logging.
+    if (/\.tmp(?:\.[^/]+)?$/.test(errorPath)) return;
+
     try {
       const content = await readFile(errorPath, "utf-8");
 
@@ -177,6 +183,8 @@ ${content}
         this.onError(errorPath, content);
       }
     } catch (err) {
+      const code = (err as { code?: string })?.code;
+      if (code === "ENOENT") return; // file was removed mid-debounce; fine
       console.error(`[ErrorCollector] Failed to process ${errorPath}:`, err);
     }
   }

@@ -1,3 +1,4 @@
+import { enqueueWebhook } from "@/bot/webhook-queue";
 import { db } from "@/src/db";
 import { createHmac } from "crypto";
 import { type NextRequest, NextResponse } from "next/server";
@@ -88,9 +89,32 @@ export async function POST(request: NextRequest) {
       processed: false,
     };
 
-    // Store to MongoDB
+    // Store to MongoDB. Dual-write: keep the historical
+    // `GithubWebhookEvents` collection for back-compat, and also push into
+    // the unified `webhook_queue` so the VM bot's changeStream consumer can
+    // pick GitHub events up alongside Slack.
     const collection = db.collection("GithubWebhookEvents");
     const result = await collection.insertOne(eventDocument);
+
+    if (deliveryId) {
+      try {
+        await enqueueWebhook({
+          source: "github",
+          eventId: deliveryId,
+          payload,
+          meta: {
+            eventType,
+            hookId,
+            hookInstallationTargetId,
+            hookInstallationTargetType,
+            userAgent: request.headers.get("user-agent"),
+            legacyId: result.insertedId.toString(),
+          },
+        });
+      } catch (qerr) {
+        console.warn("Failed to enqueue github webhook to webhook_queue", qerr);
+      }
+    }
 
     console.log(
       `Stored GitHub webhook event: ${eventType} (delivery: ${deliveryId}, _id: ${result.insertedId})`,
