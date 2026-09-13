@@ -7,7 +7,7 @@ import DIE from "@snomiao/die";
 import isCI from "is-ci";
 import parseGithubUrl from "parse-github-url";
 import sflow from "sflow";
-import { upsertSlackMessage } from "../gh-desktop-release-notification/upsertSlackMessage";
+import { upsertChunkedSlackMessage } from "./upsertChunkedSlackMessage";
 
 /**
  * GitHub Frontend Release Notification Task
@@ -39,12 +39,14 @@ export type GithubFrontendReleaseNotificationTask = {
     text: string;
     channel: string;
     url?: string;
+    overflowUrls?: string[];
   };
 
   slackMessage?: {
     text: string;
     channel: string;
     url?: string;
+    overflowUrls?: string[];
   };
 };
 
@@ -131,7 +133,6 @@ async function runGithubFrontendReleaseNotificationTask() {
         .replace("{status}", task.status)
         .replace(/$/, "\n" + formattedReleaseNotes)
         .replace(/(.*) in (https:\/\/\S*)$/gm, "<$2|$1>") // linkify URLs at the end of lines;
-        .replace(/^([\s\S]{1800}.*)\r?\n[\s\S]*?(.*[\s\S]{1800})$/, "$1\n...TRUNCATED...\n$2") // truncate to 4000 characters, slack limit is 40000 but be safe
         .replace("**Full Changelog**", "Full Changelog");
 
       console.log(newSlackMessageText);
@@ -140,16 +141,23 @@ async function runGithubFrontendReleaseNotificationTask() {
         !task.slackMessageDrafting?.text ||
         task.slackMessageDrafting.text.trim() !== newSlackMessageText.trim();
       if (shouldSendDraftingMessage && draftingTextChanged) {
+        const { main, overflowUrls } = await upsertChunkedSlackMessage({
+          channelName: config.slackChannelName,
+          fullText: newSlackMessageText,
+          existingMainUrl: task.slackMessageDrafting?.url,
+          existingOverflowUrls: task.slackMessageDrafting?.overflowUrls,
+        }).catch((e) => {
+          console.error("Failed to send draft slack message for release", task.url, e);
+          throw e;
+        });
         task = await save({
           url,
-          slackMessageDrafting: await upsertSlackMessage({
-            channelName: config.slackChannelName,
+          slackMessageDrafting: {
             text: newSlackMessageText,
-            url: task.slackMessageDrafting?.url,
-          }).catch((e) => {
-            console.error("Failed to send draft slack message for release", task.url, e);
-            throw e;
-          }),
+            channel: main.channel,
+            url: main.url,
+            overflowUrls,
+          },
         });
       }
 
@@ -157,17 +165,24 @@ async function runGithubFrontendReleaseNotificationTask() {
       const messageTextChanged =
         !task.slackMessage?.text || task.slackMessage.text.trim() !== newSlackMessageText.trim();
       if (shouldSendMessage && messageTextChanged) {
+        const { main, overflowUrls } = await upsertChunkedSlackMessage({
+          channelName: config.slackChannelName,
+          fullText: newSlackMessageText,
+          existingMainUrl: task.slackMessage?.url,
+          existingOverflowUrls: task.slackMessage?.overflowUrls,
+          replyUrl: task.slackMessageDrafting?.url,
+        }).catch((e) => {
+          console.error("Failed to send slack message for release", task.url, JSON.stringify(e));
+          throw e;
+        });
         task = await save({
           url,
-          slackMessage: await upsertSlackMessage({
-            channelName: config.slackChannelName,
+          slackMessage: {
             text: newSlackMessageText,
-            url: task.slackMessage?.url,
-            replyUrl: task.slackMessageDrafting?.url,
-          }).catch((e) => {
-            console.error("Failed to send slack message for release", task.url, JSON.stringify(e));
-            throw e;
-          }),
+            channel: main.channel,
+            url: main.url,
+            overflowUrls,
+          },
         });
       }
       return task;
