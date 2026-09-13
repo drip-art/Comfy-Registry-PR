@@ -143,31 +143,53 @@ async function SyncPriorityBetweenComfyTaskAndGithubIssue() {
   // // Query the database to get tasks
   // console.log('\nFetching tasks from database...');
   // // full scan + incremental watching
-  const checkpoint = (await State.get(NotionCheckpoint)) as { id: string; editedAt: string };
+  // Checkpoint shape:
+  //   { editedAt, processedIdsAtEditedAt[] } — robust against ties at the same last_edited_time.
+  //   Legacy { id, editedAt } is upgraded by treating { id } as the only processed id at editedAt.
+  const checkpoint = (await State.get(NotionCheckpoint)) as
+    | { id?: string; editedAt?: string; processedIdsAtEditedAt?: string[] }
+    | undefined;
   console.log("[notion] comfy-task scan resuming from checkpoint:", checkpoint);
+  const boundaryEditedAt = checkpoint?.editedAt;
+  const processedIdsAtBoundary = new Set<string>(
+    checkpoint?.processedIdsAtEditedAt ?? (checkpoint?.id ? [checkpoint.id] : []),
+  );
+  // Mutable copies used while processing this run, so subsequent items at the same
+  // boundary timestamp persist into the checkpoint and are skipped on the next run.
+  let currentBoundaryEditedAt: string | undefined = boundaryEditedAt;
+  const currentProcessedIdsAtBoundary = new Set<string>(processedIdsAtBoundary);
 
   // Sync Recent edited Comfy Tasks to GitHub Issues/PRs
-  const tasks = await pageFlow(
-    checkpoint?.id ?? (undefined as string | undefined),
-    async (cursor, page_size = 100) => {
-      // console.log(`Querying Notion data source ${data_source_id} with cursor=${cursor} page_size=${page_size}...`);
-      const ret = await notion.dataSources.query({
-        data_source_id,
-        result_type: "page",
-        filter: {
-          and: [{ property: "[GH🤖] Link", url: { is_not_empty: true } }],
+  // Notion's start_cursor must be a token returned by a previous query (next_cursor),
+  // not an arbitrary page ID. To resume from a checkpoint, filter by last_edited_time
+  // and start pagination from undefined. To handle multiple pages sharing the same
+  // last_edited_time as the checkpoint, skip those whose ids are already in
+  // processedIdsAtBoundary.
+  const checkpointFilter = boundaryEditedAt
+    ? [
+        {
+          timestamp: "last_edited_time" as const,
+          last_edited_time: { on_or_after: boundaryEditedAt },
         },
-        sorts: [{ direction: "ascending", timestamp: "last_edited_time" }],
-        page_size,
-        start_cursor: cursor,
-      });
-      // ret.next_cursor && await State.set(CHECKPOINT, ret.next_cursor);
-      return { next: ret.next_cursor, data: ret.results };
-    },
-  )
+      ]
+    : [];
+  const tasks = await pageFlow(undefined as string | undefined, async (cursor, page_size = 100) => {
+    // console.log(`Querying Notion data source ${data_source_id} with cursor=${cursor} page_size=${page_size}...`);
+    const ret = await notion.dataSources.query({
+      data_source_id,
+      result_type: "page",
+      filter: {
+        and: [{ property: "[GH🤖] Link", url: { is_not_empty: true } }, ...checkpointFilter],
+      },
+      sorts: [{ direction: "ascending", timestamp: "last_edited_time" }],
+      page_size,
+      start_cursor: cursor,
+    });
+    return { next: ret.next_cursor, data: ret.results };
+  })
     .flat()
     .map((e) => e as Notion.PageObjectResponse)
-    .filter((e) => e.id !== checkpoint?.id) // skip checkpoint entry as it's already processed
+    .filter((e) => !(e.last_edited_time === boundaryEditedAt && processedIdsAtBoundary.has(e.id)))
     .map((e) => {
       return {
         ...e,
@@ -211,7 +233,20 @@ async function SyncPriorityBetweenComfyTaskAndGithubIssue() {
         async (e) => {
           const task = e as Notion.PageObjectResponse;
           await ComfyTaskPrioritySync(task);
-          await State.set(NotionCheckpoint, { id: task.id, editedAt: task.last_edited_time }); // per-item checkpoint, can resume from last processed page
+          // Per-item checkpoint. When advancing past the previous boundary timestamp,
+          // reset the processed-id set; otherwise append the id so future runs skip
+          // every page already handled at this exact timestamp.
+          const isNewBoundary = task.last_edited_time !== currentBoundaryEditedAt;
+          if (isNewBoundary) {
+            currentBoundaryEditedAt = task.last_edited_time;
+            currentProcessedIdsAtBoundary.clear();
+          }
+          currentProcessedIdsAtBoundary.add(task.id);
+          await State.set(NotionCheckpoint, {
+            id: task.id,
+            editedAt: currentBoundaryEditedAt,
+            processedIdsAtEditedAt: [...currentProcessedIdsAtBoundary],
+          });
         },
       ),
     )
