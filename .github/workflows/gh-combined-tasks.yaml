@@ -19,6 +19,10 @@ on:
       - "app/tasks/gh-issue-transfer-*/**"
       - "app/tasks/gh-priority-sync/**"
 
+concurrency:
+  group: gh-combined-tasks
+  cancel-in-progress: true
+
 jobs:
   run_combined_github_tasks:
     runs-on: ubuntu-latest
